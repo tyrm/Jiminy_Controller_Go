@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,18 +28,24 @@ type JiminyDevice struct {
 	LastSeen  time.Time
 }
 
+type SafeDeviceList struct {
+	Devices map[string]JiminyDevice
+	Lock    sync.RWMutex
+}
+
 //*********//
 // Globals //
 //*********//
-var devices map[string]JiminyDevice
+var devices SafeDeviceList
 
 func main() {
-	devices = make(map[string]JiminyDevice)
+	devices = SafeDeviceList{Devices: make(map[string]JiminyDevice)}
 
 	//create a ClientOptions struct setting the broker address, clientid, turn
 	//off trace output and set the default message handler
 	opts := MQTT.NewClientOptions().AddBroker("tcp://10.1.68.60:1883")
-	opts.SetClientID("go-simple")
+	myMac := getMacAddr()
+	opts.SetClientID(myMac)
 
 	//create and start a client using the above ClientOptions
 	c := MQTT.NewClient(opts)
@@ -52,13 +61,16 @@ func main() {
 	http.HandleFunc("/jiminy/devices", httpDevices)
 	go http.ListenAndServe(":8080", nil)
 
+	// Start Emitting Pings
+	go pongEmitter(c)
+
 	// Wait for SIGINT and SIGTERM (HIT CTRL-C)
 	nch := make(chan os.Signal)
 	signal.Notify(nch, syscall.SIGINT, syscall.SIGTERM)
 	log.Println(<-nch)
 
-	//unsubscribe from /go-mqtt/sample
-	if token := c.Unsubscribe("/jiminy/c/all"); token.Wait() && token.Error() != nil {
+	//unsubscribe from mqtt
+	if token := c.Unsubscribe("/jiminy/reply"); token.Wait() && token.Error() != nil {
 		fmt.Println(token.Error())
 		os.Exit(1)
 	}
@@ -67,6 +79,33 @@ func main() {
 //***********//
 // Functions //
 //***********//
+func getMacAddr() (addr string) {
+	interfaces, err := net.Interfaces()
+	if err == nil {
+		for _, i := range interfaces {
+			if i.Flags&net.FlagUp != 0 && bytes.Compare(i.HardwareAddr, nil) != 0 {
+				// Don't use random as we have a real address
+				addr = i.HardwareAddr.String()
+				break
+			}
+		}
+	}
+	return
+}
+
+func (dl *SafeDeviceList) getDevice(id string) JiminyDevice {
+	dl.Lock.RLock()
+	defer dl.Lock.RUnlock()
+
+	return dl.Devices[id]
+}
+
+func (dl *SafeDeviceList) getDevices() map[string]JiminyDevice {
+	dl.Lock.RLock()
+	defer dl.Lock.RUnlock()
+
+	return dl.Devices
+}
 
 func handleReply(client MQTT.Client, msg MQTT.Message) {
 
@@ -90,7 +129,8 @@ func httpDevices(response http.ResponseWriter, request *http.Request) {
 	response.Header().Set("Content-Type", "application/json")
 
 	if request.Method == "GET" {
-		b, _ := json.Marshal(devices)
+		dl := devices.getDevices()
+		b, _ := json.Marshal(dl)
 
 		fmt.Printf(" OPTS: %s\n", b)
 		fmt.Fprintf(response, "%s", b)
@@ -117,6 +157,22 @@ func parsePacket(packet string) (cmd string, opts []string) {
     return
 }
 
+func pongEmitter(c MQTT.Client) {
+	for {
+		token := c.Publish("/jiminy/c/all", 0, false, "<PING>")
+		token.Wait()
+
+		time.Sleep(10 * time.Second)
+	}
+}
+
 func pongResponse(id string, count int) {
-	devices[id] = JiminyDevice{ID: id, Count: count, LastSeen: time.Now()}
+	devices.setDevice(id, JiminyDevice{ID: id, Count: count, LastSeen: time.Now()})
+}
+
+func (dl *SafeDeviceList) setDevice(id string, d JiminyDevice) {
+	dl.Lock.Lock()
+	defer dl.Lock.Unlock()
+
+	dl.Devices[id] = d
 }
